@@ -19,7 +19,10 @@ pipeline {
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timeout(time: 10, unit: 'MINUTES')
-        ansiColor('xterm')
+        // (ansiColor is intentionally NOT in `options` -- it's a `wrap` step
+        //  that requires the AnsiColor plugin. The default console output is
+        //  fine; install the plugin and wrap the `sh` blocks if you want
+        //  color in the logs.)
     }
 
     // -----------------------------------------------------------------
@@ -90,8 +93,7 @@ pipeline {
         stage('Setup') {
             steps {
                 // Sanity-check tooling before we touch anything.
-                sh '''
-                    set -eu
+                bat '''
                     python --version
                     git --version
                 '''
@@ -119,11 +121,10 @@ pipeline {
                     }
 
                     // Run the Python script with the assembled flags.
-                    sh """
-                        set -eu
-                        python append_to_csv.py \
-                            --file "${params.CSV_FILE}" \
-                            ${fieldArgs.join(' ')}
+                    // NOTE: cmd.exe needs the args joined into a single line.
+                    def fieldsJoined = fieldArgs.join(' ')
+                    bat """
+                        python append_to_csv.py --file "${params.CSV_FILE}" ${fieldsJoined}
                     """
                 }
             }
@@ -139,42 +140,51 @@ pipeline {
                     usernameVariable: 'GIT_USER',
                     passwordVariable: 'GIT_TOKEN'
                 )]) {
-                    sh '''
-                        set -eu
+                    bat '''
+                        @echo off
+                        setlocal EnableDelayedExpansion
 
-                        # Identify the author/committer for the bot.
-                        git config user.name  "${COMMIT_AUTHOR_NAME}"
-                        git config user.email "${COMMIT_AUTHOR_EMAIL}"
+                        rem --- Identify the author/committer for the bot.
+                        git config user.name  "%COMMIT_AUTHOR_NAME%"
+                        git config user.email "%COMMIT_AUTHOR_EMAIL%"
 
-                        # Stage the CSV file specifically -- never `git add -A`,
-                        # which would risk committing unrelated workspace changes.
-                        git add "${CSV_FILE}"
+                        rem --- Stage the CSV file specifically -- never `git add -A`,
+                        rem     which would risk committing unrelated workspace changes.
+                        git add "%CSV_FILE%"
 
-                        # Detect whether the file actually changed. If not, skip
-                        # the commit/push to avoid an empty commit and a wasted
-                        # API call.
-                        if git diff --cached --quiet; then
-                            echo "No changes detected in ${CSV_FILE}. Skipping commit."
-                            exit 0
-                        fi
+                        rem --- Detect whether the file actually changed. If not, skip
+                        rem     the commit/push to avoid an empty commit and a wasted
+                        rem     API call.
+                        git diff --cached --quiet
+                        if %ERRORLEVEL% EQU 0 (
+                            echo No changes detected in %CSV_FILE%. Skipping commit.
+                            exit /b 0
+                        )
 
-                        COMMIT_MSG="chore(data): append row to ${CSV_FILE}
+                        rem --- Build the commit message. Use a temp file so embedded
+                        rem     newlines and special characters survive intact.
+                        set "MSG_FILE=%TEMP%\\csv-commit-msg.txt"
+                        (
+                            echo chore(data^): append row to %CSV_FILE%
+                            echo.
+                            echo Build:    %BUILD_URL%
+                            echo Run id:   %BUILD_ID%
+                            echo Author:   %COMMIT_AUTHOR_NAME%
+                        ) > "%MSG_FILE%"
 
-                        Build:    ${BUILD_URL}
-                        Trigger:  ${BUILD_CAUSE}
-                        Run id:   ${BUILD_ID}
-                        Author:   ${COMMIT_AUTHOR_NAME}"
+                        git commit -F "%MSG_FILE%"
+                        del "%MSG_FILE%"
 
-                        git commit -m "${COMMIT_MSG}"
+                        rem --- Rewrite the remote URL to embed the token so the push
+                        rem     authenticates non-interactively. The URL is scoped to
+                        rem     this command block -- never persisted to .git/config.
+                        for /f "delims=" %%U in ('git config --get remote.origin.url') do set "REMOTE_URL=%%U"
+                        set "AUTH_URL=https://%GIT_USER%:%GIT_TOKEN%@!REMOTE_URL:https://=!"
 
-                        # Rewrite the remote URL to embed the token so the push
-                        # authenticates non-interactively. The URL is scoped to
-                        # this command via an env-var-style substitution.
-                        REMOTE_URL=$(git config --get remote.origin.url)
-                        AUTH_URL=$(echo "${REMOTE_URL}" | sed "s#https://#https://${GIT_USER}:${GIT_TOKEN}@#")
-
-                        # Push back to the same branch we built from.
-                        git push "${AUTH_URL}" "HEAD:${BRANCH_NAME:-main}"
+                        rem --- Push back to the same branch we built from.
+                        set "BRANCH=%BRANCH_NAME%"
+                        if "!BRANCH!"=="" set "BRANCH=main"
+                        git push "%AUTH_URL%" "HEAD:!BRANCH!"
                     '''
                 }
             }
@@ -192,8 +202,16 @@ pipeline {
         }
         always {
             // Clean up the workspace so secrets (and large CSVs) don't linger.
-            cleanWs(deleteDirs: true,
-                    patterns: [[pattern: '.git/**', type: 'INCLUDE']])
+            // Wrapped in try/catch in case the Workspace Cleanup plugin is
+            // not installed on this Jenkins instance.
+            script {
+                try {
+                    cleanWs(deleteDirs: true,
+                            patterns: [[pattern: '.git/**', type: 'INCLUDE']])
+                } catch (NoSuchMethodError | MissingMethodException ignored) {
+                    echo "Workspace Cleanup plugin not installed; skipping cleanWs."
+                }
+            }
         }
     }
 }
