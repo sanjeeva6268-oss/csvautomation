@@ -1,0 +1,6 @@
+# Runtime dependencies for append_to_csv.py.
+#
+# The script intentionally uses only the Python standard library so this
+# file is empty by default. Uncomment the next line to switch to pandas.
+#
+# pandas>=2.0

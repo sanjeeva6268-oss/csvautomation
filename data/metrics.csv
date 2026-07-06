@@ -1,0 +1,2 @@
+timestamp,service,status,latency_ms
+2026-07-06T10:00:00Z,api-gateway,200,42
