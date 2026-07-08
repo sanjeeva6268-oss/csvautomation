@@ -33,18 +33,9 @@ pipeline {
         string(name: 'CSV_FILE',
                defaultValue: 'data/metrics.csv',
                description: 'Path to the CSV file inside the repo (relative path).')
-        string(name: 'FIELD_TIMESTAMP',
+        string(name: 'PR_NUMBER',
                defaultValue: '',
-               description: 'Value for the "timestamp" column (e.g. 2026-07-06T10:00:00Z).')
-        string(name: 'FIELD_SERVICE',
-               defaultValue: '',
-               description: 'Value for the "service" column.')
-        string(name: 'FIELD_STATUS',
-               defaultValue: '',
-               description: 'Value for the "status" column (e.g. 200, 500).')
-        string(name: 'FIELD_LATENCY_MS',
-               defaultValue: '',
-               description: 'Value for the "latency_ms" column.')
+               description: 'GitHub PR number (auto-set by the GitHub PR trigger). Leave blank for manual runs.')
         string(name: 'COMMIT_AUTHOR_NAME',
                defaultValue: 'csv-bot',
                description: 'Git author name for the auto-commit.')
@@ -55,11 +46,14 @@ pipeline {
 
     // -----------------------------------------------------------------
     // Triggers -- this pipeline can be:
-    //   * started manually with parameters, or
-    //   * triggered by a GitHub webhook on push to `main`.
+    //   * started manually with parameters (set PR_NUMBER + body), or
+    //   * triggered automatically when a PR is opened / updated against
+    //     this repo. The GitHub Branch Source plugin populates the
+    //     ghprbPullId / ghprbActualCommit env vars from the webhook.
     //
-    // The webhook URL is /github-webhook/ on the Jenkins controller and
-    // the repository settings -> Webhooks should point at it.
+    // The webhook URL is /github-webhook/ on the Jenkins controller; the
+    // GitHub repo -> Settings -> Webhooks should point at it with the
+    // "Pull requests" events enabled.
     // -----------------------------------------------------------------
     triggers {
         githubPush()
@@ -102,30 +96,99 @@ pipeline {
 
         stage('Append row to CSV') {
             steps {
-                // Build the --field arguments from parameters only when the
-                // operator actually provided values, so empty parameters
-                // don't pollute the row.
-                script {
-                    def fieldArgs = []
-                    ['FIELD_TIMESTAMP', 'FIELD_SERVICE', 'FIELD_STATUS', 'FIELD_LATENCY_MS'].each { p ->
-                        def val = params[p]?.trim()
-                        if (val) {
-                            // Convert PARAM_FIELD_TIMESTAMP -> "timestamp"
-                            def col = p.replace('FIELD_', '').toLowerCase()
-                            fieldArgs << "--field ${col}=${val}"
+                // Two ways to get the row data:
+                //   1. From a GitHub PR -- the PR title + body contain
+                //      "key=value" lines that we forward to the Python script.
+                //   2. From a manual "Build with Parameters" run, where the
+                //      operator can also pass raw key=value lines via the
+                //      PR_FIELDS_RAW parameter.
+                withCredentials([usernamePassword(
+                    credentialsId: env.GITHUB_CREDENTIALS_ID,
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_TOKEN'
+                )]) {
+                    script {
+                        // Resolve which PR we should read from. PR_NUMBER is
+                        // the canonical parameter; we also fall back to the
+                        // ghprb* env vars that the GitHub Branch Source
+                        // plugin sets automatically.
+                        def prNumber = params.PR_NUMBER?.trim()
+                        if (!prNumber) {
+                            prNumber = env.ghprbPullId ?: env.CHANGE_ID ?: ''
                         }
-                    }
+                        if (!prNumber) {
+                            error("No PR_NUMBER provided and no GitHub PR context detected. " +
+                                  "Either set the PR_NUMBER parameter (Build with Parameters) " +
+                                  "or open a PR to trigger this build via webhook.")
+                        }
 
-                    if (fieldArgs.isEmpty()) {
-                        error("No --field values were provided. At least one FIELD_* parameter must be set.")
-                    }
+                        echo "Fetching PR #${prNumber} from ${env.GIT_URL_NAME ?: 'origin'}..."
 
-                    // Run the Python script with the assembled flags.
-                    // NOTE: cmd.exe needs the args joined into a single line.
-                    def fieldsJoined = fieldArgs.join(' ')
-                    bat """
-                        python append_to_csv.py --file "${params.CSV_FILE}" ${fieldsJoined}
-                    """
+                        // Fetch the PR's title + body via the GitHub REST API.
+                        // The URL is the remote origin minus ".git".
+                        def remoteUrl = bat(returnStdout: true, script: '@echo off\r\ngit config --get remote.origin.url').trim()
+                        def repoPath  = (remoteUrl =~ /github\.com[/:](.+?)\.git$/).with { m -> m ? m[0][1] : null }
+                        if (!repoPath) {
+                            error("Could not parse GitHub repo path from remote URL: ${remoteUrl}")
+                        }
+                        def apiUrl = "https://api.github.com/repos/${repoPath}/pulls/${prNumber}"
+
+                        // Use curl via bat so we can capture both stdout and the
+                        // HTTP status code in one call.
+                        def prJson = bat(returnStdout: true, script: """
+                            @echo off
+                            curl -sS -w "\\n__HTTP__%{http_code}" ^
+                                 -H "Authorization: Bearer %GIT_TOKEN%" ^
+                                 -H "Accept: application/vnd.github+json" ^
+                                 "${apiUrl}"
+                        """).trim()
+
+                        // curl prints "<json>\n__HTTP__<code>". Split it.
+                        def httpCode = (prJson =~ /__HTTP__(\d+)$/)[0][1] as Integer
+                        def jsonBody = prJson.replaceAll(/__HTTP__\d+\s*$/, '').trim()
+                        if (httpCode != 200) {
+                            error("GitHub API returned HTTP ${httpCode} for ${apiUrl}. Body: ${jsonBody}")
+                        }
+
+                        // Extract "title" and "body" from the JSON. We use a
+                        // tiny regex here so we don't have to add a JSON
+                        // parser plugin; the GitHub response is well-formed
+                        // and our regexes are anchored.
+                        def title = (jsonBody =~ /"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"/).with { m -> m ? m[0][1].replaceAll('\\\\"', '"') : '' }
+                        def body  = (jsonBody =~ /"body"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"/).with { m -> m ? m[0][1].replaceAll('\\\\"', '"').replaceAll('\\\\n', '\\n').replaceAll('\\\\r', '') : '' }
+
+                        echo "PR #${prNumber} title: ${title}"
+
+                        // Combine title and body, then harvest every "key=value"
+                        // pair. Lines that don't match the format are ignored.
+                        def rawText = (title + "\n" + body)
+                        def fieldArgs = []
+                        rawText.split('\n').each { line ->
+                            def m = (line.trim() =~ /^([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.+)$/)
+                            if (m) {
+                                def key   = m[0][1]
+                                def value = m[0][2].trim()
+                                // Strip surrounding quotes if the author used them.
+                                if (value.startsWith('"') && value.endsWith('"')) {
+                                    value = value.substring(1, value.length() - 1)
+                                }
+                                fieldArgs << "--field ${key}=${value}"
+                            }
+                        }
+
+                        if (fieldArgs.isEmpty()) {
+                            error("No 'key=value' pairs were found in PR #${prNumber}'s title or body. " +
+                                  "Add lines like 'service=auth' / 'status=500' / 'latency_ms=312' to the PR description.")
+                        }
+
+                        echo "Fields to append: ${fieldArgs.join(' ')}"
+                        env.CSV_FIELDS = fieldArgs.join(' ')
+
+                        // Hand off to the Python script via cmd.exe.
+                        bat """
+                            python append_to_csv.py --file "${params.CSV_FILE}" %CSV_FIELDS%
+                        """
+                    }
                 }
             }
         }
@@ -161,16 +224,29 @@ pipeline {
                             exit /b 0
                         )
 
+                        rem --- Resolve the target branch.
+                        rem     When triggered by a PR, push back to the PR's
+                        rem     head branch so the PR sees the change. Otherwise
+                        rem     push to whatever branch was checked out (or main).
+                        set "BRANCH=%BRANCH_NAME%"
+                        if "!BRANCH!"=="" set "BRANCH=main"
+                        if defined CHANGE_BRANCH set "BRANCH=%CHANGE_BRANCH%"
+                        if defined ghprbSourceBranch set "BRANCH=%ghprbSourceBranch%"
+
                         rem --- Build the commit message. Use a temp file so embedded
                         rem     newlines and special characters survive intact.
                         set "MSG_FILE=%TEMP%\\csv-commit-msg.txt"
                         (
-                            echo chore(data^): append row to %CSV_FILE%
+                            echo chore(data^): append row to %CSV_FILE% via PR #%PR_NUMBER%
                             echo.
-                            echo Build:    %BUILD_URL%
-                            echo Run id:   %BUILD_ID%
-                            echo Author:   %COMMIT_AUTHOR_NAME%
+                            echo Build:   %BUILD_URL%
+                            echo Run id:  %BUILD_ID%
+                            echo Branch:  !BRANCH!
+                            echo Author:  %COMMIT_AUTHOR_NAME%
+                            echo.
+                            echo Fields:
                         ) > "%MSG_FILE%"
+                        echo %CSV_FIELDS% >> "%MSG_FILE%"
 
                         git commit -F "%MSG_FILE%"
                         del "%MSG_FILE%"
@@ -181,9 +257,7 @@ pipeline {
                         for /f "delims=" %%U in ('git config --get remote.origin.url') do set "REMOTE_URL=%%U"
                         set "AUTH_URL=https://%GIT_USER%:%GIT_TOKEN%@!REMOTE_URL:https://=!"
 
-                        rem --- Push back to the same branch we built from.
-                        set "BRANCH=%BRANCH_NAME%"
-                        if "!BRANCH!"=="" set "BRANCH=main"
+                        rem --- Push back to the resolved branch.
                         git push "%AUTH_URL%" "HEAD:!BRANCH!"
                     '''
                 }
