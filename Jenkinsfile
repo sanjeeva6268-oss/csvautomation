@@ -127,7 +127,16 @@ pipeline {
                         // Fetch the PR's title + body via the GitHub REST API.
                         // The URL is the remote origin minus ".git".
                         def remoteUrl = bat(returnStdout: true, script: '@echo off\r\ngit config --get remote.origin.url').trim()
-                        def repoPath  = (remoteUrl =~ /github\.com[/:](.+?)\.git$/).with { m -> m ? m[0][1] : null }
+                        // Extract "<owner>/<repo>" from the remote URL. Examples:
+                        //   https://github.com/sanjeeva6268-oss/csvautomation.git
+                        //   git@github.com:sanjeeva6268-oss/csvautomation.git
+                        def repoPath = null
+                        def m1 = (remoteUrl =~ /^https?:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/)
+                        if (m1) { repoPath = m1[0][1] }
+                        if (repoPath == null) {
+                            def m2 = (remoteUrl =~ /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/)
+                            if (m2) { repoPath = m2[0][1] }
+                        }
                         if (!repoPath) {
                             error("Could not parse GitHub repo path from remote URL: ${remoteUrl}")
                         }
@@ -150,12 +159,17 @@ pipeline {
                             error("GitHub API returned HTTP ${httpCode} for ${apiUrl}. Body: ${jsonBody}")
                         }
 
-                        // Extract "title" and "body" from the JSON. We use a
-                        // tiny regex here so we don't have to add a JSON
-                        // parser plugin; the GitHub response is well-formed
-                        // and our regexes are anchored.
-                        def title = (jsonBody =~ /"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"/).with { m -> m ? m[0][1].replaceAll('\\\\"', '"') : '' }
-                        def body  = (jsonBody =~ /"body"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"/).with { m -> m ? m[0][1].replaceAll('\\\\"', '"').replaceAll('\\\\n', '\\n').replaceAll('\\\\r', '') : '' }
+                        // Extract "title" and "body" from the JSON. We use
+                        // anchored regexes so we don't have to add a JSON
+                        // parser plugin; the GitHub response is well-formed.
+                        // Note: uses Java-string regexes (not Groovy slashies)
+                        // to avoid colon-inside-char-class parser confusion.
+                        def titleMatch = (jsonBody =~ '"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
+                        def title = titleMatch ? titleMatch[0][1].replaceAll('\\\\"', '"') : ''
+                        def bodyMatch  = (jsonBody =~ '"body"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
+                        def body  = bodyMatch ? bodyMatch[0][1].replaceAll('\\\\"', '"')
+                                                       .replaceAll('\\\\n', '\\n')
+                                                       .replaceAll('\\\\r', '') : ''
 
                         echo "PR #${prNumber} title: ${title}"
 
@@ -163,8 +177,9 @@ pipeline {
                         // pair. Lines that don't match the format are ignored.
                         def rawText = (title + "\n" + body)
                         def fieldArgs = []
+                        def pairRe = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/
                         rawText.split('\n').each { line ->
-                            def m = (line.trim() =~ /^([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.+)$/)
+                            def m = (line.trim() =~ pairRe)
                             if (m) {
                                 def key   = m[0][1]
                                 def value = m[0][2].trim()
