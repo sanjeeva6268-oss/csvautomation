@@ -47,13 +47,15 @@ pipeline {
     // -----------------------------------------------------------------
     // Triggers -- this pipeline can be:
     //   * started manually with parameters (set PR_NUMBER + body), or
-    //   * triggered automatically when a PR is opened / updated against
-    //     this repo. The GitHub Branch Source plugin populates the
-    //     ghprbPullId / ghprbActualCommit env vars from the webhook.
+    //   * triggered automatically on a push to a branch.
     //
-    // The webhook URL is /github-webhook/ on the Jenkins controller; the
-    // GitHub repo -> Settings -> Webhooks should point at it with the
-    // "Pull requests" events enabled.
+    // NOTE: `githubPush()` only fires on `push` events, NOT on pull-request
+    // open/synchronize events. The runtime code below still accepts a
+    // PR_NUMBER parameter and reads the PR title/body from the GitHub API
+    // for *manual* runs, but it will NOT be invoked automatically when a
+    // PR is opened -- to get that behaviour, run this as a multibranch
+    // pipeline backed by the GitHub Branch Source plugin (which sets
+    // CHANGE_ID / CHANGE_BRANCH / ghprbPullId on PR builds).
     // -----------------------------------------------------------------
     triggers {
         githubPush()
@@ -70,13 +72,17 @@ pipeline {
             steps {
                 // Clone the repo. If `main` doesn't exist, fall back to `master`
                 // so this works on older repos too.
+                // Use env.GIT_URL (always set when the build is tied to a
+                // Git SCM) and fall back to scm.userRemoteConfigs[0].url for
+                // older Jenkins versions that don't expose GIT_URL.
                 script {
                     def branch = env.BRANCH_NAME ?: 'main'
+                    def remoteUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url
                     checkout([
                         $class           : 'GitSCM',
                         branches         : [[name: "*/${branch}"]],
                         userRemoteConfigs: [[
-                            url          : scm.userRemoteConfigs[0].url,
+                            url          : remoteUrl,
                             credentialsId: env.GITHUB_CREDENTIALS_ID
                         ]]
                     ])
@@ -126,16 +132,24 @@ pipeline {
 
                         // Fetch the PR's title + body via the GitHub REST API.
                         // The URL is the remote origin minus ".git".
-                        def remoteUrl = bat(returnStdout: true, script: '@echo off\r\ngit config --get remote.origin.url').trim()
+                        // Note: don't include `@echo off` here -- in a `bat`
+                        // step with `returnStdout: true`, the `@echo off` line
+                        // itself gets emitted to stdout before it can take
+                        // effect, which would corrupt the captured output.
+                        def remoteUrl = bat(returnStdout: true, script: 'git config --get remote.origin.url').trim()
                         // Extract "<owner>/<repo>" from the remote URL. Examples:
                         //   https://github.com/sanjeeva6268-oss/csvautomation.git
                         //   git@github.com:sanjeeva6268-oss/csvautomation.git
-                        def repoPath = null
-                        def m1 = (remoteUrl =~ /^https?:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/)
-                        if (m1) { repoPath = m1[0][1] }
+                        // We use java.util.regex.Pattern explicitly (NOT Groovy
+                        // slashy strings /.../ or ~/.../) to avoid a Groovy parser
+                        // bug with character classes inside slashy regexes.
+                        def ownerRepoRe1 = java.util.regex.Pattern.compile('^https?://github\\.com/([^/]+/[^/]+?)(?:\\.git)?$')
+                        def m1 = ownerRepoRe1.matcher(remoteUrl)
+                        def repoPath = m1.matches() ? m1.group(1) : null
                         if (repoPath == null) {
-                            def m2 = (remoteUrl =~ /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/)
-                            if (m2) { repoPath = m2[0][1] }
+                            def ownerRepoRe2 = java.util.regex.Pattern.compile('^git@github\\.com:([^/]+/[^/]+?)(?:\\.git)?$')
+                            def m2 = ownerRepoRe2.matcher(remoteUrl)
+                            if (m2.matches()) { repoPath = m2.group(1) }
                         }
                         if (!repoPath) {
                             error("Could not parse GitHub repo path from remote URL: ${remoteUrl}")
@@ -144,8 +158,9 @@ pipeline {
 
                         // Use curl via bat so we can capture both stdout and the
                         // HTTP status code in one call.
+                        // Note: no leading `@echo off` -- see comment on the
+                        // `git config` call above for why.
                         def prJson = bat(returnStdout: true, script: """
-                            @echo off
                             curl -sS -w "\\n__HTTP__%{http_code}" ^
                                  -H "Authorization: Bearer %GIT_TOKEN%" ^
                                  -H "Accept: application/vnd.github+json" ^
@@ -153,23 +168,32 @@ pipeline {
                         """).trim()
 
                         // curl prints "<json>\n__HTTP__<code>". Split it.
-                        def httpCode = (prJson =~ /__HTTP__(\d+)$/)[0][1] as Integer
-                        def jsonBody = prJson.replaceAll(/__HTTP__\d+\s*$/, '').trim()
+                        // Use Pattern.compile (not slashy strings) for safety.
+                        def httpCodeRe  = java.util.regex.Pattern.compile('__HTTP__(\\d+)$')
+                        def httpMatcher = httpCodeRe.matcher(prJson)
+                        if (!httpMatcher.find()) {
+                            error("Could not find __HTTP__ marker in curl output. Output was: ${prJson}")
+                        }
+                        def httpCode = httpMatcher.group(1) as Integer
+                        def jsonBody = prJson.substring(0, httpMatcher.start()).trim()
                         if (httpCode != 200) {
                             error("GitHub API returned HTTP ${httpCode} for ${apiUrl}. Body: ${jsonBody}")
                         }
 
                         // Extract "title" and "body" from the JSON. We use
-                        // anchored regexes so we don't have to add a JSON
-                        // parser plugin; the GitHub response is well-formed.
-                        // Note: uses Java-string regexes (not Groovy slashies)
-                        // to avoid colon-inside-char-class parser confusion.
-                        def titleMatch = (jsonBody =~ '"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
-                        def title = titleMatch ? titleMatch[0][1].replaceAll('\\\\"', '"') : ''
-                        def bodyMatch  = (jsonBody =~ '"body"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
-                        def body  = bodyMatch ? bodyMatch[0][1].replaceAll('\\\\"', '"')
-                                                       .replaceAll('\\\\n', '\\n')
-                                                       .replaceAll('\\\\r', '') : ''
+                        // Pattern.compile (not slashy strings) to avoid the
+                        // character-class-in-slashy parser bug.
+                        def titleRe = java.util.regex.Pattern.compile('"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
+                        def titleMatcher = titleRe.matcher(jsonBody)
+                        def title = titleMatcher.find() ? titleMatcher.group(1).replaceAll('\\\\"', '"') : ''
+                        def bodyRe = java.util.regex.Pattern.compile('"body"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')
+                        def bodyMatcher = bodyRe.matcher(jsonBody)
+                        def body  = bodyMatcher.find()
+                            ? bodyMatcher.group(1)
+                                .replaceAll('\\\\"', '"')
+                                .replaceAll('\\\\n', '\\n')
+                                .replaceAll('\\\\r', '')
+                            : ''
 
                         echo "PR #${prNumber} title: ${title}"
 
@@ -177,17 +201,23 @@ pipeline {
                         // pair. Lines that don't match the format are ignored.
                         def rawText = (title + "\n" + body)
                         def fieldArgs = []
-                        def pairRe = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/
+                        // Use Pattern.compile (not slashy strings) for safety.
+                        def pairRe = java.util.regex.Pattern.compile('^([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.+)$')
                         rawText.split('\n').each { line ->
-                            def m = (line.trim() =~ pairRe)
-                            if (m) {
-                                def key   = m[0][1]
-                                def value = m[0][2].trim()
+                            def m = pairRe.matcher(line.trim())
+                            if (m.matches()) {
+                                def key   = m.group(1)
+                                def value = m.group(2).trim()
                                 // Strip surrounding quotes if the author used them.
-                                if (value.startsWith('"') && value.endsWith('"')) {
+                                if (value.startsWith('"') && value.endsWith('"') && value.length() >= 2) {
                                     value = value.substring(1, value.length() - 1)
                                 }
-                                fieldArgs << "--field ${key}=${value}"
+                                // Wrap the value in double quotes and escape any
+                                // embedded `"` so cmd.exe's argument splitter hands
+                                // the entire `key=value` token to Python intact --
+                                // even if `value` contains spaces.
+                                value = value.replace('"', '\\"')
+                                fieldArgs << "--field ${key}=\"${value}\""
                             }
                         }
 
@@ -243,22 +273,30 @@ pipeline {
                         rem     When triggered by a PR, push back to the PR's
                         rem     head branch so the PR sees the change. Otherwise
                         rem     push to whatever branch was checked out (or main).
-                        set "BRANCH=%BRANCH_NAME%"
-                        if "!BRANCH!"=="" set "BRANCH=main"
+                        rem     PR-specific env vars (CHANGE_BRANCH, ghprbSourceBranch)
+                        rem     take precedence over BRANCH_NAME, which on multibranch
+                        rem     PR builds usually points at the *target* branch.
+                        set "BRANCH="
                         if defined CHANGE_BRANCH set "BRANCH=%CHANGE_BRANCH%"
                         if defined ghprbSourceBranch set "BRANCH=%ghprbSourceBranch%"
+                        if "!BRANCH!"=="" if defined BRANCH_NAME set "BRANCH=%BRANCH_NAME%"
+                        if "!BRANCH!"=="" set "BRANCH=main"
+                        if "!BRANCH!"=="" (
+                            echo ERROR: Could not determine target branch. Aborting push.
+                            exit /b 1
+                        )
 
                         rem --- Build the commit message. Use a temp file so embedded
                         rem     newlines and special characters survive intact.
                         set "MSG_FILE=%TEMP%\\csv-commit-msg.txt"
                         (
                             echo chore(data^): append row to %CSV_FILE% via PR #%PR_NUMBER%
-                            echo.
+                            echo(
                             echo Build:   %BUILD_URL%
                             echo Run id:  %BUILD_ID%
                             echo Branch:  !BRANCH!
                             echo Author:  %COMMIT_AUTHOR_NAME%
-                            echo.
+                            echo(
                             echo Fields:
                         ) > "%MSG_FILE%"
                         echo %CSV_FIELDS% >> "%MSG_FILE%"
@@ -269,8 +307,11 @@ pipeline {
                         rem --- Rewrite the remote URL to embed the token so the push
                         rem     authenticates non-interactively. The URL is scoped to
                         rem     this command block -- never persisted to .git/config.
+                        rem     Split into two `set` statements so a `!` inside the
+                        rem     PAT doesn't break cmd's `set` parser.
                         for /f "delims=" %%U in ('git config --get remote.origin.url') do set "REMOTE_URL=%%U"
-                        set "AUTH_URL=https://%GIT_USER%:%GIT_TOKEN%@!REMOTE_URL:https://=!"
+                        call set "REMOTE_URL_NO_SCHEME=%%REMOTE_URL:https://=%%"
+                        set "AUTH_URL=https://%GIT_USER%:%GIT_TOKEN%@%REMOTE_URL_NO_SCHEME%"
 
                         rem --- Push back to the resolved branch.
                         git push "%AUTH_URL%" "HEAD:!BRANCH!"
@@ -295,8 +336,7 @@ pipeline {
             // not installed on this Jenkins instance.
             script {
                 try {
-                    cleanWs(deleteDirs: true,
-                            patterns: [[pattern: '.git/**', type: 'INCLUDE']])
+                    cleanWs(deleteDirs: true)
                 } catch (NoSuchMethodError | MissingMethodException ignored) {
                     echo "Workspace Cleanup plugin not installed; skipping cleanWs."
                 }
