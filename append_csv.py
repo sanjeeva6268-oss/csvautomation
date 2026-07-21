@@ -58,7 +58,7 @@ def git_commit_and_push():
                 ["git", "commit", "-m", "ci: update csv log file [skip ci]"],
                 check=True,
             )
-            subprocess.run(["git", "push", "origin", "HEAD"], check=True)
+            subprocess.run(["git", "push", "origin", "main"], check=True)
             print("Successfully pushed updated CSV to GitHub.")
         else:
             print("No changes detected.")
