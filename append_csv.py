@@ -3,7 +3,7 @@ import os
 import subprocess
 from datetime import datetime
 
-CSV_FILE = "data.csv"
+CSV_FILE = "data/metrics.csv"
 
 
 def append_data_row():
