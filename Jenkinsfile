@@ -23,7 +23,7 @@ pipeline {
                     git remote set-url origin "https://%GITHUB_USER%:%GITHUB_PAT%@github.com/YOUR_USER/YOUR_REPO.git"
                     
                     rem Use the absolute path to python.exe
-                    "C:\\Users\\YourUser\\AppData\\Local\\Programs\\Python\\Python311\\python.exe" append_csv.py
+                    "C:\\Users\\hp\\AppData\\Local\\Programs\\Python\\Python313\\python.exe" append_csv.py
                 '''
                     }
                 }
