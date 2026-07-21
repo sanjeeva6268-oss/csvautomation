@@ -1,142 +1,147 @@
 #!/usr/bin/env python3
 """
 append_csv.py
---------------
+-------------
+Append a new row to data/my_data.csv, commit the change, and push to GitHub.
 
-Append a single row to a CSV file that lives in the workspace.
+Usage (CLI):
+    python append_csv.py --col1 VALUE1 --col2 VALUE2 ...
 
-* The script is deliberately simple – it only uses the standard library.
-* It validates that:
-  - the file exists,
-  - the supplied column values match the header length,
-  - the header order is unchanged (optional strict mode).
-
-The script is intended to be called from a Jenkins pipeline, e.g.:
-
-    python3 append_csv.py \
-        --file data/users.csv \
-        --row "john.doe@example.com,John,Doe,2024-07-18"
-
+Or via environment variables:
+    COL1=VALUE1 COL2=VALUE2 python append_csv.py
 """
 
-import argparse
-import csv
 import os
 import sys
-from datetime import datetime
+import argparse
+import datetime
 from pathlib import Path
-from typing import List
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Append a row to a CSV file in-place."
-    )
-    parser.add_argument(
-        "-f", "--file",
-        required=True,
-        help="Path to the CSV file (relative to the workspace).",
-    )
-    parser.add_argument(
-        "-r", "--row",
-        required=True,
-        help=(
-            "Comma‑separated values for the new row. "
-            "If a value contains commas, surround it with double quotes."
-        ),
-    )
-    parser.add_argument(
-        "--strict-header",
-        action="store_true",
-        help="Fail if the number of supplied values does not exactly match the header columns.",
-    )
-    parser.add_argument(
-        "--date-format",
-        default="%Y-%m-%d",
-        help="If a column looks like a date, optionally validate it (default: YYYY‑MM‑DD).",
-    )
-    return parser.parse_args()
+import pandas as pd
+from git import Repo, GitCommandError
+from dotenv import load_dotenv
 
+# ----------------------------------------------------------------------
+# 1️⃣ Load env (Git credentials, optional)
+# ----------------------------------------------------------------------
+load_dotenv()  # reads .env if present
 
-def read_header(csv_path: Path) -> List[str]:
-    """Read the first row (header) of the CSV."""
-    with csv_path.open(newline="") as f:
-        reader = csv.reader(f)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise ValueError("CSV file is empty – no header found.")
-    return header
+# ----------------------------------------------------------------------
+# 2️⃣ Configurable constants (feel free to move to a config file)
+# ----------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]               # my‑csv‑updater/
+CSV_PATH = REPO_ROOT / "data" / "my_data.csv"
+BRANCH = os.getenv("GIT_BRANCH", "main")                     # target branch
+COMMIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", "ci-bot")
+COMMIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "ci@example.com")
+REMOTE_NAME = "origin"
 
+# ----------------------------------------------------------------------
+# 3️⃣ Parse incoming row data
+# ----------------------------------------------------------------------
+def parse_cli():
+    parser = argparse.ArgumentParser(description="Append a row to the CSV.")
+    # Define as many columns as you need; for demo we use generic col1…col5
+    for i in range(1, 6):
+        parser.add_argument(f"--col{i}", required=False, help=f"Value for column {i}")
+    args = parser.parse_args()
+    # Build dict of non‑None values
+    row = {f"col{i}": getattr(args, f"col{i}") for i in range(1, 6) if getattr(args, f"col{i}") is not None}
+    return row
 
-def validate_row(header: List[str], values: List[str], strict: bool) -> None:
-    """Basic sanity checks before writing."""
-    if strict and len(values) != len(header):
-        raise ValueError(
-            f"Row length ({len(values)}) does not match header length ({len(header)})."
+def parse_env():
+    """Read COL1, COL2 … from environment (overrides CLI if present)."""
+    row = {}
+    for i in range(1, 6):
+        val = os.getenv(f"COL{i}")
+        if val is not None:
+            row[f"col{i}"] = val
+    return row
+
+def build_row():
+    # precedence: env > CLI > auto‑generated timestamp column
+    row = parse_cli()
+    env_row = parse_env()
+    row.update(env_row)  # env overwrites CLI if set
+    # Add a timestamp column if you like
+    row.setdefault("timestamp", datetime.datetime.utcnow().isoformat())
+    return row
+
+# ----------------------------------------------------------------------
+# 4️⃣ CSV handling
+# ----------------------------------------------------------------------
+def load_or_create_csv(path: Path) -> pd.DataFrame:
+    if path.is_file():
+        df = pd.read_csv(path, dtype=str)  # keep everything as string to avoid dtype drift
+    else:
+        # No file yet → start with an empty DataFrame
+        df = pd.DataFrame()
+    return df
+
+def append_row_to_csv(csv_path: Path, row: dict):
+    df = load_or_create_csv(csv_path)
+    # Ensure all columns exist
+    for col in row.keys():
+        if col not in df.columns:
+            df[col] = pd.NA
+    # Append
+    df = df.append(row, ignore_index=True)  # pandas < 2.0
+    # For pandas >= 2.0 you can use:
+    # df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    # Write back (no index column)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    return csv_path
+
+# ----------------------------------------------------------------------
+# 5️⃣ Git operations
+# ----------------------------------------------------------------------
+def git_commit_and_push(repo_path: Path, file_path: Path, branch: str):
+    repo = Repo(repo_path)
+    git = repo.git
+
+    # Make sure we are on the correct branch
+    try:
+        repo.git.checkout(branch)
+    except GitCommandError as e:
+        # If the branch does not exist locally, try to create tracking branch
+        repo.git.checkout("-b", branch, f"{REMOTE_NAME}/{branch}")
+
+    # Stage the CSV
+    repo.index.add([str(file_path.relative_to(repo_path))])
+
+    # Check if there is anything to commit (skip empty commits)
+    if repo.is_dirty(untracked_files=False):
+        commit_message = f"CI: Append row to {file_path.name} – {datetime.datetime.utcnow().isoformat()}Z"
+        repo.index.commit(
+            commit_message,
+            author=repo.config_reader().get_value("user", "name", fallback=COMMIT_AUTHOR_NAME),
+            author_email=repo.config_reader().get_value("user", "email", fallback=COMMIT_AUTHOR_EMAIL),
         )
-    # Optional: you can add per‑column validation here (e.g. email format, date parsing)
-    # Example date validation for any column that looks like a date:
-    # for v in values:
-    #     try: datetime.strptime(v, "%Y-%m-%d")
-    #     except ValueError: pass  # ignore non‑date strings
+        # Push – use credentials that Jenkins injects (see §3)
+        try:
+            git.push(REMOTE_NAME, branch)
+        except GitCommandError as e:
+            print(f"❌ Push failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print("✅ Commit & push successful")
+    else:
+        print("ℹ️ No changes detected – nothing to commit")
 
+# ----------------------------------------------------------------------
+# 6️⃣ Main orchestration
+# ----------------------------------------------------------------------
+def main():
+    row = build_row()
+    if not row:
+        print("❌ No data supplied (neither CLI nor env). Exiting.")
+        sys.exit(1)
 
-def append_row(csv_path: Path, row: List[str]) -> None:
-    """Append the row using the csv.writer in append mode."""
-    # Open in append mode with newline='' to avoid extra blank lines on Linux.
-    with csv_path.open(mode="a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
+    print(f"🗂️  Appending row: {row}")
+    append_row_to_csv(CSV_PATH, row)
 
-
-def main() -> int:
-    args = parse_args()
-    csv_path = Path(args.file).resolve()
-
-    # -------------------------------------------------
-    # 1️⃣  Sanity checks
-    # -------------------------------------------------
-    if not csv_path.is_file():
-        print(f"[ERROR] CSV file does not exist: {csv_path}", file=sys.stderr)
-        return 1
-
-    try:
-        header = read_header(csv_path)
-    except Exception as e:
-        print(f"[ERROR] Unable to read header: {e}", file=sys.stderr)
-        return 1
-
-    # Split the incoming row respecting quoted commas
-    # csv module does this nicely via a temporary reader
-    try:
-        row_vals = next(csv.reader([args.row]))
-    except Exception as e:
-        print(f"[ERROR] Could not parse '--row' argument: {e}", file=sys.stderr)
-        return 1
-
-    # -------------------------------------------------
-    # 2️⃣  Validation
-    # -------------------------------------------------
-    try:
-        validate_row(header, row_vals, args.strict_header)
-    except ValueError as ve:
-        print(f"[ERROR] Validation failed: {ve}", file=sys.stderr)
-        return 1
-
-    # -------------------------------------------------
-    # 3️⃣  Append
-    # -------------------------------------------------
-    try:
-        append_row(csv_path, row_vals)
-        print(f"[INFO] Successfully appended row to {csv_path}")
-        print(f"[DEBUG] Header   : {header}")
-        print(f"[DEBUG] New row  : {row_vals}")
-    except Exception as e:
-        print(f"[ERROR] Failed to write CSV: {e}", file=sys.stderr)
-        return 1
-
-    return 0
-
+    # Repo root is two levels up from this script (project root)
+    git_commit_and_push(REPO_ROOT, CSV_PATH, BRANCH)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
