@@ -1,23 +1,11 @@
-# Python
+# Python artefacts
 __pycache__/
 *.py[cod]
-*.egg-info/
-.venv/
+*.pyo
+*.pyd
+env/
 venv/
-.env
-
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Jenkins
-workspace/
-@*
-builds/
+.venv/
+# Jenkins workspace artefacts (optional)
 *.log
-
-# Local test artifacts
-*.bak
 *.tmp
