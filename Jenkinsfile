@@ -1,28 +1,28 @@
 pipeline {
     agent any
 
-    environment {
-        // Retrieve credentials configured in Jenkins
-        GITHUB_CREDS = credentials('github-credentials-id')
-    }
-
     stages {
         stage('Checkout') {
             steps {
+                // Check out source code from your configured Git repository
                 checkout scm
             }
         }
 
         stage('Update CSV & Push') {
             steps {
-                script {
-                    // Update the remote URL with embedded PAT for push permissions
-                    sh '''
-                        git remote set-url origin https://${GITHUB_CREDS_USR}:${GITHUB_CREDS_PSW}@github.com/${GIT_KEY}.git
-                    '''
-                    
-                    // Run Python automation script
-                    sh 'python3 append_csv.py'
+                // Use withCredentials to securely handle Git authentication
+                withCredentials([usernamePassword(credentialsId: 'github-credentials-id', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PAT')]) {
+                    script {
+                        // Dynamically pull the repo path (e.g. username/repo.git) from the checked-out Git config
+                        sh '''
+                            REPO_URL=$(git config --get remote.origin.url | sed -E 's|https://[^@]+@||; s|https://||; s|git@github.com:|github.com/|')
+                            git remote set-url origin "https://${GITHUB_USER}:${GITHUB_PAT}@${REPO_URL}"
+                            
+                            # Run Python automation script
+                            python3 append_csv.py
+                        '''
+                    }
                 }
             }
         }
@@ -30,7 +30,12 @@ pipeline {
 
     post {
         always {
-            cleanWs() // Clean up workspace after run
+            script {
+                // Safely clean workspace only if an active agent/workspace context exists
+                if (getContext(hudson.FilePath)) {
+                    cleanWs()
+                }
+            }
         }
     }
 }
