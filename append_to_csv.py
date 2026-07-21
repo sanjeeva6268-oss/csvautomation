@@ -30,7 +30,7 @@ load_dotenv()  # reads .env if present
 # 2️⃣ Configurable constants (feel free to move to a config file)
 # ----------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[1]               # my‑csv‑updater/
-CSV_PATH = REPO_ROOT / "data" / "my_data.csv"
+CSV_PATH = REPO_ROOT / "data" / "metrics.csv"
 BRANCH = os.getenv("GIT_BRANCH", "main")                     # target branch
 COMMIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", "ci-bot")
 COMMIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "ci@example.com")
