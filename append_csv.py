@@ -22,20 +22,31 @@ def append_data_row():
     print(f"Appended new row: {new_row}")
 
 
+import os
+import subprocess
+
+
 def git_commit_and_push():
     try:
-        # Configure local git user for CI execution
-        subprocess.run(
-            ["git", "config", "user.name", "Jenkins CI"], check=True
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "jenkins@example.com"], check=True
-        )
+        # Get credentials injected by Jenkins withCredentials
+        github_user = os.environ.get("GITHUB_USER")
+        github_pat = os.environ.get("GITHUB_PAT")
 
-        # Stage, commit, and push
+        # ⚠️ REPLACE THESE WITH YOUR ACTUAL GITHUB USERNAME & REPO NAME
+        repo_owner = "sanjeeva6268-oss"
+        repo_name = "csvautomation"
+
+        if github_user and github_pat:
+            # Construct authenticated remote URL dynamically
+            authenticated_url = f"https://{github_user}:{github_pat}@github.com/{repo_owner}/{repo_name}.git"
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", authenticated_url],
+                check=True,
+            )
+
+        # Stage and commit
         subprocess.run(["git", "add", CSV_FILE], check=True)
 
-        # Check if there are changes to commit
         status = subprocess.run(
             ["git", "status", "--porcelain"], capture_output=True, text=True
         )
@@ -44,7 +55,7 @@ def git_commit_and_push():
                 ["git", "commit", "-m", "ci: update csv log file [skip ci]"],
                 check=True,
             )
-            # Push using origin HEAD to target current branch
+            # Push explicitly back to origin
             subprocess.run(["git", "push", "origin", "HEAD"], check=True)
             print("Successfully pushed updated CSV to GitHub.")
         else:
@@ -52,7 +63,6 @@ def git_commit_and_push():
     except subprocess.CalledProcessError as e:
         print(f"Git operation failed: {e}")
         raise
-
 
 if __name__ == "__main__":
     append_data_row()
